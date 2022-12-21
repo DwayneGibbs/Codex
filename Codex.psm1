@@ -114,37 +114,6 @@ $engine = 'code-davinci-002'
 $secretName = 'CodexOpenApiKey'
 $contextList = [System.Collections.Generic.List[string]]::new()
 $defaultContext = @"
-# what processes are hogging the most cpu?
-Get-Process | Sort-Object -Property CPU -Descending | Select-Object -First 10
-
-# stop the chrome processes
-Get-Process chrome | Stop-Process
-
-# what's my IP address?
-(Invoke-WebRequest -uri "http://ifconfig.me/ip").Content
-
-# what's the weather in New York?
-(Invoke-WebRequest -uri "wttr.in/NewYork").Content
-
-# make a git ignore with node modules and src in it
-"node_modules
-src" | Out-File .gitignore
-
-# open it in notepad
-notepad .gitignore
-
-# what's running on port 1018?
-Get-Process -Id (Get-NetTCPConnection -LocalPort 1018).OwningProcess
-
-# kill process 1584
-Stop-Process -Id 1584
-
-# what other devices are on my network?
-Get-NetIPAddress | Format-Table
-
-# how much storage is left on my pc?
-Get-WmiObject -Class Win32_LogicalDisk | Select-Object -Property DeviceID,FreeSpace,Size,DriveType | Format-Table -AutoSize
-
 # how many GB is 367247884288 B?
 (367247884288 / 1GB)
 "@
@@ -160,7 +129,7 @@ function Get-CodexCompletion {
         throw "OpenAI API key not found. Please use Register-CodexOpenApiKey to register your OpenAI API key"
     }
 
-    $contextList.Add("\n" + $Line.Replace('"', '\"'))
+    #$contextList.Add("\n\n" + $Line.Replace('"', '\"'))
 
     $trimList = $false
     do {
@@ -168,17 +137,79 @@ function Get-CodexCompletion {
             $contextList.RemoveAt(0)
         }
 
-        $context = [string]::Join("\n", $contextList.ToArray()).Replace('"', '\"')
-        [int]$tokenCount = $context.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries).count + $contextList.Count - 1
+        $context = $contextList.ToArray()
+        [int]$tokenCount = $context[0].Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries).count + $contextList.Count - 1
         $trimList = $true
     }
     while ($tokenCount -gt 4096)
  
-    $body = "{`"prompt`": `"<# powershell #>\n\n$context`", `"temperature`": 0, `"max_tokens`": 300, `"stop`":`"#`"}"
+    $moderation = Get-ModerationClassification -Context $($context[0].ToString().Trim()) -ApiKey $ApiKey
 
-    Write-Progress -Activity "Codex" -Status "Getting completion..."
+    if($moderation.results.flagged -eq $true){
+        $moderationModel = $moderation.model
+        $categories = $moderation.results.categories | Get-Member -MemberType NoteProperty | Select-Object -Property Name
+        $violatedCategories = $null
+        $categories | ForEach-Object{
+            $categoryName = $_.Name
+            if($null -eq $violatedCategories -and $moderation.results.categories.$($categoryName) -eq $true){
+                $violatedCategories = $categoryName
+            }elseif($moderation.results.categories.$($categoryName) -eq $true){
+                $violatedCategories = $violatedCategories + ", " + $categoryName
+            }
+        }
+        Write-Warning "The model, $($moderationModel), has classified the content as having violated OpenAI's content policy in the following categories: $($categories)"
+    }elseif($null -eq $moderation){
+        Write-Warning "Content could not be validated on a moderation model."
+    }else{
+
+        #$body = @{ model="$($engine)"; prompt="$($context[0].ToString().Trim())"; temperature= 0; max_tokens=300; stop="#" } | ConvertTo-Json -Compress
+        #$body = @{ model="code-davinci-002"; prompt="Say this is a test"; max_tokens=7; temperature=0; top_p=1; n=1; stream=false; logprobs=null; stop="\n" } | ConvertTo-Json -Compress 
+        $body = @{ model="code-davinci-002"; prompt="Say this is a test"; max_tokens=7; temperature=0; } | ConvertTo-Json -Compress
+
+        Write-Progress -Activity "Codex" -Status "Getting completion..."
+        try {
+            $completion = Invoke-RestMethod -Uri "https://api.openai.com/v1/completions" -ContentType 'application/json' -Authentication Bearer -Token $ApiKey -Body $body -Method Post
+        }
+        catch {
+            Write-Error $_
+            Write-Verbose -Verbose $body
+        }
+
+        Write-Progress -Activity "Codex" -Completed
+
+        $response = $completion.Choices.Text
+
+        if ($null -ne $response) {
+            $contextList.Add($response.Trim().Replace("`n", "\n"))
+            return $response
+        }
+        else {
+            Write-Warning "Did not receive response from OpenAI"
+        }
+    }
+}
+
+function Get-ModerationClassification {
+    param (
+        [ValidateNotNullOrEmpty()]
+        [string]$context,    
+        
+        [securestring]$ApiKey
+    )
+
+
+    if ($null -eq $ApiKey) {
+        $ApiKey = Get-Secret -Name $secretName -ErrorAction Ignore
+        if($null -eq $ApiKey){
+            throw "OpenAI API key not found. Please use Register-CodexOpenApiKey to register your OpenAI API key"
+        }
+    }
+    
+    $body = @{input="$($context.Trim())"} | ConvertTo-Json -Compress
+
+    Write-Progress -Activity "Codex" -Status "Getting moderation results..."
     try {
-        $completion = Invoke-RestMethod -Uri "https://api.openai.com/v1/engines/$engine/completions" -ContentType 'application/json' -Authentication Bearer -Token $ApiKey -Body $body -Method Post
+        $moderation = Invoke-RestMethod -Uri "https://api.openai.com/v1/moderations" -ContentType 'application/json' -Authentication Bearer -Token $ApiKey -Body $body -Method Post
     }
     catch {
         Write-Error $_
@@ -186,14 +217,11 @@ function Get-CodexCompletion {
     }
 
     Write-Progress -Activity "Codex" -Completed
-
-    $response = $completion.Choices.Text
-
-    if ($null -ne $response) {
-        $contextList.Add($response.Trim().Replace("`n", "\n"))
-        return $response
+    
+    if ($null -ne $moderation) {
+        return $moderation
     }
     else {
-        Write-Warning "Did not receive response from OpenAI"
+        Write-Warning "Did not receive response from OpenAI when getting moderation classification."
     }
 }
